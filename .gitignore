@@ -1,0 +1,13 @@
+# Build output
+/build/
+
+# Runtime output
+/captures/
+/logs/
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+*~
+
