@@ -1,3 +1,96 @@
+four_camera_capture:
+  # 逻辑方位只在管理层使用；HikCamera 只根据 serial 操作物理相机。
+  cameras:
+    Front_SERIAL: DB1505181
+    Rear_SERIAL: DB1505189
+    Left_SERIAL: DB1505196
+    Right_SERIAL: DB1505182
+
+  image:
+    # 100 FPS 优先：保持 4:3，将四路 BayerRG8 原始负载降至约 122.9 MB/s。
+    width: 640
+    height: 480
+    pixel_format: BayerRG8
+    frame_rate: 100
+
+  capture:
+    # 当前亮度试验：关闭自动曝光，固定为完整的 10 ms 触发周期。
+    exposure_auto: false
+    exposure_time_us: 10000
+    # 100 Hz 触发周期为 10 ms，自动曝光不得跨越下一次触发。
+    auto_exposure_upper_limit_us: 8000
+    # 自动曝光/增益的目标灰度；相机支持范围 0-255，默认 100 在当前环境偏暗。
+    auto_brightness_target: 160
+    # false 时 HikCamera 会读取并设置每台相机自身的 Gain 最大值。
+    gain_auto: false
+    # fixed 表示关闭相机自动白平衡，使用固定的红/蓝通道系数。
+    white_balance_mode: fixed
+    white_balance_red: 1.8
+    white_balance_blue: 1.6
+
+  trigger:
+    # 可选：FREE_RUN / SOFTWARE_TRIGGER / HARDWARE_TRIGGER
+    mode: SOFTWARE_TRIGGER
+    software_frequency_hz: 100
+    trigger_cache: true
+
+  buffering:
+    frames_per_camera: 4
+    # GetImageBuffer 的单次等待上限；超时只计数，不终止采集线程。
+    grab_timeout_ms: 100
+
+  processing:
+    # 相机和软件触发仍保持 100 FPS；这里只控制同步 FrameGroup 的下游输出节拍。
+    output_fps: 80
+
+  isp:
+    enabled: true
+    # 默认必须使用 Jetson CUDA/NPP；opencv_cpu 只用于显式正确性对照。
+    backend: cuda_npp
+    active_cameras: 4
+    queue_depth: 2
+    output_buffers_per_camera: 4
+    white_balance_red: 1.0
+    white_balance_green: 1.0
+    white_balance_blue: 1.0
+    gamma: 1.0
+    color_matrix: [1.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0,
+                   0.0, 0.0, 1.0]
+
+  encoder:
+    enabled: true
+    codec: h264
+    fps: 80
+    bitrate_front: 20000000
+    bitrate_rear: 20000000
+    bitrate_left: 20000000
+    bitrate_right: 20000000
+    gop: 40
+    low_latency: true
+    active_cameras: 4
+    queue_depth: 2
+
+  output:
+    mode: null
+    file_directory: ./encoded
+    queue_depth: 2
+
+  network:
+    server_ip: "127.0.0.1"
+    payload_type: 96
+    mtu: 1400
+    metadata_enabled: true
+    metadata_port: 5100
+    metadata_queue_depth: 4
+
+  streams:
+    front_port: 5000
+    rear_port: 5002
+    left_port: 5004
+    right_port: 5006
+
+# 旧单相机预览配置暂时保留，在四路应用完成前不破坏现有 camera_app。
 camera:
   # connection: 连接参数（MV-CS016-10UC USB3.0 相机）
   connection:

@@ -1,13 +1,21 @@
 # Build output
 /build/
+/build-*/
 
 # Runtime output
 /captures/
 /logs/
+/encoded/
+*.h264
+*.h265
+*.nv12
+
+# Language caches
+__pycache__/
+*.py[cod]
 
 # Editor and OS metadata
 .vscode/
 .idea/
 .DS_Store
 *~
-
