@@ -47,8 +47,8 @@ four_camera_capture:
     device_link_throughput_limit_bps: 140000
 
   processing:
-    # 采集、同步组帧和下游输出均保持 60 FPS，不做抽帧。
-    output_fps: 60
+    # 采集和同步组帧保持 60 FPS，下游抽帧为 45 FPS 以降低无线传输压力。
+    output_fps: 45
 
   isp:
     enabled: true
@@ -67,12 +67,12 @@ four_camera_capture:
 
   encoder:
     enabled: true
-    codec: h264
-    fps: 60
-    bitrate_front: 20000000
-    bitrate_rear: 20000000
-    bitrate_left: 20000000
-    bitrate_right: 20000000
+    codec: h265
+    fps: 45
+    bitrate_front: 2000000
+    bitrate_rear: 2000000
+    bitrate_left: 2000000
+    bitrate_right: 2000000
     gop: 30
     low_latency: true
     active_cameras: 4
@@ -85,7 +85,7 @@ four_camera_capture:
 
   network:
     server_ip: "192.168.3.93"
-    srt_latency_ms: 500
+    srt_latency_ms: 250
     payload_type: 96
     mtu: 1400
     metadata_enabled: true

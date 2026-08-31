@@ -1,350 +1,177 @@
-# 四路环视视频发送/服务器接收交接文档
+# 四路环视视频发送/接收交接文档
 
-文档版本：1.0
+文档版本：2.0
 
 协议版本：SVMD v1
 
-更新日期：2026-08-25
+更新日期：2026-08-31
 
-## 1. 范围与当前状态
+## 1. 当前交付基线
 
-Jetson Orin NX 发送端的数据通路为：
+当前正式视频链路为四路独立 H.265/MPEG-TS over SRT，metadata 仍使用独立 UDP：
 
 ```text
-4路 BayerRG8 采集
-  -> Software Trigger / FrameGroup
-  -> 100 FPS 时间戳选择为 80 FPS
-  -> CUDA/NPP ISP (NV12)
-  -> Jetson 硬件 H.264
-  -> 4路独立 RTP/UDP
-  + 1路 FrameGroup metadata UDP
+Jetson Orin NX
+  4× MV-CB016-10UC-S
+  1440×1080 BayerRG8 @60
+    -> Software Trigger / FrameGroup @60
+    -> 时间戳选择 @45
+    -> CUDA/NPP ISP (NV12)
+    -> 4× nvv4l2h265enc @45, 2 Mbps/路, GOP 30
+    -> h265parse -> mpegtsmux
+    -> 4× SRT caller
+
+  FrameGroup metadata -> UDP 5100 (SVMD v1)
+
+接收电脑
+  4× SRT listener
+    -> tsdemux -> h265parse -> decoder
+    -> videoconvert/videoscale/videorate
+    -> compositor -> 1440×1080@60 preview
 ```
 
-服务器后续可进行解码、鱼眼校正、BEV 和拼接，但这些算法不属于当前 NX 仓库。
+当前地址：
 
-当前已验证配置是 **4×640×480@80 FPS**，每路约 20 Mbps。
-4×1440×1080@80 FPS 是最终目标，但尚未完成该分辨率的长时稳定性验收。
+- Jetson：`192.168.3.8`
+- 接收电脑：`192.168.3.93`
 
-## 2. 网络契约
+RTP/UDP 代码和旧接收脚本继续保留作兼容与诊断，不是当前默认方案。AV1 代码是实验能力，不属于当前交付基线。
 
-默认目的端口如下。服务器应绑定 `0.0.0.0`或指定的本地网卡 IP，
-不应依赖 Jetson 的 UDP 源端口，因为源端口是动态的。
+## 2. 视频网络契约
 
-| 逻辑流 | 目的 UDP 端口 | 内容 |
-|---|---:|---|
-| Front | 5000 | H.264 RTP |
-| Rear | 5002 | H.264 RTP |
-| Left | 5004 | H.264 RTP |
-| Right | 5006 | H.264 RTP |
-| FrameGroup metadata | 5100 | 136 字节 SVMD v1 |
+### 2.1 连接角色和端口
 
-网络层特性：
+Jetson 固定为 SRT caller，接收电脑固定为 listener：
 
-- 视频使用 RTP over UDP，没有 RTSP、SDP 服务或 RTCP 控制面。
-- Metadata 使用独立的原始 UDP 数据报。
-- 当前不提供重传、加密、认证或拥塞控制，建议使用可控局域网。
-- 默认总视频码率约 80 Mbps，加上 RTP/UDP/IP 开销后应预留更多带宽；正式部署建议千兆有线网络。
-- 服务器防火墙需允许 UDP 5000、5002、5004、5006、5100。
+| 逻辑流 | Jetson 目标 URI | 电脑监听 URI |
+|---|---|---|
+| Front | `srt://192.168.3.93:5000?mode=caller&latency=250` | `srt://0.0.0.0:5000?mode=listener&latency=250` |
+| Rear | `srt://192.168.3.93:5002?mode=caller&latency=250` | `srt://0.0.0.0:5002?mode=listener&latency=250` |
+| Left | `srt://192.168.3.93:5004?mode=caller&latency=250` | `srt://0.0.0.0:5004?mode=listener&latency=250` |
+| Right | `srt://192.168.3.93:5006?mode=caller&latency=250` | `srt://0.0.0.0:5006?mode=listener&latency=250` |
+| Metadata | UDP 目标 `192.168.3.93:5100` | UDP 5100 |
 
-## 3. RTP 视频协议
+防火墙需允许 UDP 5000、5002、5004、5006 和 5100。SRT 建立在 UDP 上；不要按 TCP 端口放行。
 
-### 3.1 默认 H.264 参数
+### 2.2 当前编码参数
 
 | 项目 | 值 |
 |---|---|
-| RTP media | `video` |
-| encoding-name | `H264` |
-| payload type | 96（可配置） |
-| RTP clock rate | 90000 Hz |
-| RTP MTU | 1400 字节（可配置） |
-| H.264 stream format | byte-stream / Annex B |
-| H.264 alignment | Access Unit |
-| 默认帧率 | 80 FPS |
-| 默认 GOP | 40 帧（约 0.5 s） |
+| Codec | H.265/HEVC |
+| 输入尺寸 | 1440×1080 |
+| 编码帧率 | 45 FPS |
+| 码率 | 2,000,000 bit/s/路，四路目标总计约 8 Mbps |
+| GOP / IDR interval | 30 帧，约 0.67 秒 |
 | B 帧 | 0 |
-| SPS/PPS | 编码器插入，RTP payloader 每秒周期发送 |
-| 默认码率 | 每路 20,000,000 bit/s |
+| 码流 | Annex-B byte-stream，AU 对齐 |
+| 封装 | MPEG-TS，`mpegtsmux alignment=7` |
+| SRT latency | 250 ms，发送与接收两端一致 |
 
-服务器必须为 UDP 输入显式提供 RTP caps：
+相机采集和 FrameGroup 仍为 60 FPS。45 FPS 只作用于下游选择、编码和视频传输，不改变相机触发频率。
 
-```text
-application/x-rtp,
-media=video,
-encoding-name=H264,
-payload=96,
-clock-rate=90000
-```
+### 2.3 Pipeline
 
-发送端为每个编码 Access Unit 设置 PTS，四个属于同一 `FrameGroup` 的帧使用相同 PTS。
-RTP payloader 把该 PTS 换算为 90 kHz RTP timestamp。
-
-一帧 H.264 通常被拆成多个 UDP/RTP 包：
-
-- 同一帧的所有 RTP 包共用同一 RTP timestamp。
-- 该帧最后一个 RTP 包的 Marker bit 为 1。
-- 不能把“第 N 个 UDP 包”视为“第 N 帧”。
-- RTP sequence number 只用于单路内的丢包/乱序检查，不用于四路组帧。
-- SSRC 由每路 RTP 会话产生，服务器应以目的端口和实际 SSRC 管理流，不要写死 SSRC。
-
-RTP timestamp 是 32 位无符号值，约每 13.26 小时回绕一次。
-缓存、排序和比较代码必须按 32 位模算术处理回绕。
-
-### 3.2 H.265 扩展
-
-发送端保留 `codec: h265` 配置和 Jetson `nvv4l2h265enc`/`rtph265pay` 路径。
-切换后 `encoding-name` 为 `H265`，服务器应使用 H.265 depay/parser/decoder。
-H.265 不是当前局域网验收基线；未经重新验收不应直接在生产系统启用。
-
-## 4. SVMD v1 Metadata 协议
-
-### 4.1 传输规则
-
-- 默认目的 UDP 端口：5100。
-- 每个选中的 `FrameGroup` 发送一个 metadata 数据报。
-- 数据报固定为 136 字节，不是裸 C/C++ struct。
-- 所有多字节整数使用 network byte order（big-endian）。
-- 有符号 64 位字段使用二进制补码的 big-endian 表示。
-- UDP 可丢包、乱序或重复；接收端必须允许 metadata 比视频先到或后到。
-
-### 4.2 头部字段
-
-| 字节偏移 | 大小 | 类型 | 字段 | 说明 |
-|---:|---:|---|---|---|
-| 0 | 4 | uint32 | magic | `0x53564D44`，ASCII `SVMD` |
-| 4 | 2 | uint16 | version | 当前为 1 |
-| 6 | 2 | uint16 | packet_size | 当前为 136 |
-| 8 | 8 | uint64 | group_id | 组 ID；当前实现等于 `trigger_cycle` |
-| 16 | 8 | uint64 | trigger_cycle | Software Trigger 周期号 |
-| 24 | 8 | int64 | group_timestamp | 同步组时间戳，Jetson steady-clock ns |
-| 32 | 4 | uint32 | rtp_timestamp | 用于视频帧映射的 90 kHz RTP timestamp |
-| 36 | 4 | uint32 | reserved | 当前必须为 0；接收端应忽略未来的非零值 |
-
-`group_timestamp` 是该组四帧 `host_timestamp` 的最大值，表示四帧已齐备的时刻。
-steady clock 不是 Unix epoch，不能直接转换为日历时间，也不能与服务器本机时钟直接相减。
-它可用于 Jetson 单次启动内的顺序、间隔和 RTP timestamp 还原。
-
-90 kHz 换算规则是整数向下取整，最终保留低 32 位：
+Jetson 每路发送 pipeline 的关键段为：
 
 ```text
-seconds   = group_timestamp_ns / 1_000_000_000
-remainder = group_timestamp_ns % 1_000_000_000
-rtp_timestamp = (seconds * 90_000
-                 + remainder * 90_000 / 1_000_000_000) mod 2^32
+nvv4l2h265enc
+  bitrate=2000000
+  iframeinterval=30
+  idrinterval=30
+  insert-sps-pps=true
+  num-B-Frames=0
+-> h265parse config-interval=-1
+-> appsink max-buffers=2 drop=true sync=false
+-> 程序有界 latest queue
+-> appsrc block=false caps=video/x-h265,stream-format=byte-stream,alignment=au
+-> queue max-size-buffers=2 leaky=downstream
+-> h265parse config-interval=-1
+-> mpegtsmux alignment=7
+-> srtsink mode=caller latency=250
+   wait-for-connection=false sync=false async=false
 ```
 
-### 4.3 四路帧字段
-
-偏移 40 开始固定按 `Front, Rear, Left, Right` 顺序放置 4 个 24 字节记录：
-
-| 相机 | 记录偏移 | frame_number | device_timestamp | host_timestamp |
-|---|---:|---:|---:|---:|
-| Front | 40 | 40 | 48 | 56 |
-| Rear | 64 | 64 | 72 | 80 |
-| Left | 88 | 88 | 96 | 104 |
-| Right | 112 | 112 | 120 | 128 |
-
-每个记录的字段为：
-
-| 记录内偏移 | 大小 | 类型 | 字段 |
-|---:|---:|---|---|
-| 0 | 8 | uint64 | frame_number |
-| 8 | 8 | uint64 | device_timestamp |
-| 16 | 8 | int64 | host_timestamp（Jetson steady-clock ns） |
-
-`device_timestamp` 是相机/MVS SDK 原始值。未做时钟单位或跨相机校正的协议承诺，
-服务器不应仅依赖它来恢复四路组帧。
-
-### 4.4 协议校验
-
-接收端至少必须检查：
+接收端每路关键段为：
 
 ```text
-UDP payload length == 136
-magic == 0x53564D44
-version == 1
-packet_size == 136
+srtsrc mode=listener latency=250
+-> tsdemux
+-> h265parse
+-> nvh265dec（fallback: vah265dec / avdec_h265）
+-> videoconvert -> videoscale -> videorate
+-> video/x-raw,format=I420,width=1440,height=1080,framerate=60/1
+-> queue max-size-buffers=4 leaky=downstream
+-> compositor
 ```
 
-对未知 version 不要按 v1 强行解析；记录错误后丢弃该包。
+四路 raw caps 在进入 compositor 前显式统一为普通 `video/x-raw` I420。最终窗口 1440×1080@60，每个 tile 为 720×540；流中实际新增画面为 45 FPS，`videorate` 只负责匹配显示输出速率。
 
-## 5. 服务器恢复四路 FrameGroup
+## 3. USB 采集约束
 
-### 5.1 映射主键
+四台相机共享 Realtek USB Hub 和 Jetson `tegra-xusb`。以下配置已经实机验证，不应随网络调优一起修改：
 
-**视频帧与 metadata 的唯一标准映射键是 32 位 `rtp_timestamp`。**
+```yaml
+width: 1440
+height: 1080
+pixel_format: BayerRG8
+frame_rate: 60
 
-四个属于同一 `FrameGroup` 的视频帧，在四路 RTP 上使用同一 RTP timestamp；
-metadata 包中的 `rtp_timestamp` 也是该值。
+usb_transfer_size: 2097152
+usb_transfer_ways: 1
+sdk_image_nodes: 8
+device_link_throughput_limit_bps: 140000
+```
 
-不要使用以下方法组帧：
-
-- UDP 包到达顺序。
-- 每路第 N 个 RTP 包或第 N 帧。
-- 服务器的接收时间“差不多”匹配。
-- 不同 RTP 流的 sequence number。
-
-### 5.2 推荐接收状态机
+相机打开后、开始采集前，初始化必须保持：
 
 ```text
-metadata UDP -> validate -> metadata_by_rtp_ts[rtp_timestamp]
-
-Front RTP -> jitter/reorder -> depayload/decode -> frame_by_ts[Front][rtp_timestamp]
-Rear  RTP -> jitter/reorder -> depayload/decode -> frame_by_ts[Rear ][rtp_timestamp]
-Left  RTP -> jitter/reorder -> depayload/decode -> frame_by_ts[Left ][rtp_timestamp]
-Right RTP -> jitter/reorder -> depayload/decode -> frame_by_ts[Right][rtp_timestamp]
-
-when metadata and all four decoded frames exist for one rtp_timestamp:
-    emit ServerFrameGroup(metadata, front, rear, left, right)
-    erase all five cached entries
+DeviceLinkThroughputLimitMode = On
+DeviceLinkThroughputLimit = 140000
 ```
 
-实现要求：
-
-1. 在 depayload 前读取 RTP header，或通过所用媒体框架保留每个 Access Unit 的原始 RTP timestamp。
-2. 对多包帧，以相同 RTP timestamp 聚合，Marker bit=1 表示帧边界。
-3. 解码后必须把 RTP timestamp 作为 side data 与图像一起传递，不能在解码层丢失。
-4. Metadata 通常在编码前提交，因此可能比视频帧先到；协议不保证到达顺序。
-5. 所有缓存必须有容量和超时限制。建议以低延迟为优先，仅保留最近 16–64 组，
-   或按现场网络把超时设为 100–500 ms。
-6. 超时仍缺 metadata 或某路帧时，丢弃该不完整组并记录缺失原因，不允许无界等待。
-7. 对 metadata 重复包和 RTP 重复包做幂等处理。
-8. Jetson 重启或 RTP SSRC 变化时，清空对应流的旧缓存，重新建立时间戳上下文。
-
-服务器组帧完成后，业务层使用 `group_id`/`trigger_cycle` 标识组，
-RTP timestamp 主要用于传输层关联。
-
-## 6. 服务器接收测试
-
-### 6.1 Ubuntu 依赖
-
-```bash
-sudo apt update
-sudo apt install -y \
-  gstreamer1.0-tools \
-  gstreamer1.0-plugins-base \
-  gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad \
-  gstreamer1.0-libav
-```
-
-正式服务器应根据 GPU 选择已验证的硬件解码器。
-`avdec_h264` 只是通用正确性基线，不代表 4×1440×1080@80 FPS 的服务器性能方案。
-
-### 6.2 单路 Front 显示
-
-```bash
-gst-launch-1.0 -v \
-  udpsrc address=0.0.0.0 port=5000 \
-    caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
-  ! rtpjitterbuffer latency=50 drop-on-latency=true \
-  ! rtph264depay ! h264parse ! avdec_h264 \
-  ! videoconvert ! autovideosink sync=false
-```
-
-无图形界面时，将末尾替换为：
+成功日志至少应包含：
 
 ```text
-! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false
+throughput_limit_mode_set_ret=0x0
+throughput_limit_requested=140000
+throughput_limit_readback=140000
+throughput_limit_set_ret=0x0
+throughput_limit_read_ret=0x0
 ```
 
-### 6.3 四路 2×2 预览
+字段名中的 `bps` 为兼容已有配置而保留，实际数值尺度以相机 GenICam 节点为准。
 
-当前 Ubuntu/X11 接收机已验证：
+## 4. 配置与启动
 
-```bash
-cd /home/ubuntu/桌面/test/四路环视相机
-./scripts/receive_four_grid.sh
-```
+### 4.1 Jetson 配置
 
-布局为：
-
-```text
-Front | Rear
-------+------
-Left  | Right
-```
-
-该脚本只用于联调预览，输出窗口为 1280×960@25 FPS；
-它不做 metadata 组帧，不是正式拼接服务器。
-
-### 6.4 Metadata 可读性测试
-
-```bash
-python3 scripts/receive_metadata.py --bind 0.0.0.0 --port 5100
-```
-
-### 6.5 RTP/metadata 映射验收
-
-先启动校验器，再启动 Jetson 发送端：
-
-```bash
-python3 scripts/verify_loopback_sync.py \
-  --bind 0.0.0.0 \
-  --active-streams 4 \
-  --duration 16
-```
-
-该脚本直接绑定 5000/5002/5004/5006/5100，因此不能与正式接收程序或四宫格脚本同时运行。
-
-成功输出示例：
-
-```text
-metadata packets=639 unique_ts=639 invalid=0
-Front ... marker_frames=638 matched=638/638 (100.00%)
-Rear  ... marker_frames=637 matched=637/637 (100.00%)
-Left  ... marker_frames=631 matched=631/631 (100.00%)
-Right ... marker_frames=628 matched=628/628 (100.00%)
-RESULT=PASS
-```
-
-有限时长验收结束时，各路最后数帧数量可能略有不同；
-判定依据是实际收到的帧与 metadata 映射比例，而不是截止瞬间的绝对数量。
-
-## 7. Jetson 配置和启动
-
-### 7.1 修改服务器 IP
-
-Jetson 当前测试工程：
-
-```text
-/home/nvidia/four_camera_capture_test.4fo99V
-```
-
-编辑：
-
-```bash
-cd /home/nvidia/four_camera_capture_test.4fo99V
-nano config/config.yaml
-```
-
-将 `server_ip` 改为正式服务器的 IPv4 地址：
+关键配置为：
 
 ```yaml
 four_camera_capture:
   processing:
-    output_fps: 80
+    output_fps: 45
 
   encoder:
     enabled: true
-    codec: h264
-    fps: 80
-    bitrate_front: 20000000
-    bitrate_rear: 20000000
-    bitrate_left: 20000000
-    bitrate_right: 20000000
-    gop: 40
+    codec: h265
+    fps: 45
+    bitrate_front: 2000000
+    bitrate_rear: 2000000
+    bitrate_left: 2000000
+    bitrate_right: 2000000
+    gop: 30
     low_latency: true
     active_cameras: 4
     queue_depth: 2
 
   output:
-    mode: null
+    mode: srt
     queue_depth: 2
 
   network:
-    server_ip: "<SERVER_IPV4>"
-    payload_type: 96
-    mtu: 1400
+    server_ip: "192.168.3.93"
+    srt_latency_ms: 250
     metadata_enabled: true
     metadata_port: 5100
     metadata_queue_depth: 4
@@ -356,21 +183,33 @@ four_camera_capture:
     right_port: 5006
 ```
 
-`--output rtp` 会覆盖配置中的 `output.mode`。
-**程序只在启动时读取配置，修改 `server_ip` 后必须重启进程。**
+程序只在启动时读取配置。修改 IP、码率、帧率或 SRT latency 后必须重启发送端；SRT latency 还必须同步修改接收端 URI。
 
-### 7.2 环境检查
+### 4.2 插件检查
+
+Jetson：
 
 ```bash
-cd /home/nvidia/four_camera_capture_test.4fo99V
-./scripts/check_jetson_multimedia.sh
+gst-inspect-1.0 nvv4l2h265enc
+gst-inspect-1.0 h265parse
+gst-inspect-1.0 mpegtsmux
+gst-inspect-1.0 srtsink
 ```
 
-结果必须为 `RESULT PASS`。必须使用 Jetson `nvv4l2h264enc`，不应静默切换为 x264 软编码。
+接收电脑：
 
-### 7.3 构建与单元测试
+```bash
+gst-inspect-1.0 srtsrc
+gst-inspect-1.0 tsdemux
+gst-inspect-1.0 h265parse
+gst-inspect-1.0 nvh265dec
+```
 
-正规构建命令：
+如果没有 `nvh265dec`，仓库脚本会尝试 VA-API 或 libav 软件解码器。
+
+### 4.3 构建
+
+在 Jetson 上：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
@@ -379,159 +218,197 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-当前测试镜像也存在已构建目录 `build-phase4`。交付/部署应统一到 `build`，
-不应长期依赖阶段性目录名。
+测试设备当前也保留 `build-phase4`。正式交付应使用统一的 `build` 目录。
 
-### 7.4 启动四路 RTP 发送
+### 4.4 启动顺序
 
-先让服务器绑定所有接收端口，再在 Jetson 启动：
+先在电脑启动 listener：
+
+```bash
+cd /home/ubuntu/桌面/test/四路环视相机
+./scripts/receive_four_grid_srt.sh
+```
+
+再在 Jetson 启动 caller：
 
 ```bash
 cd /home/nvidia/four_camera_capture_test.4fo99V
-export LD_LIBRARY_PATH=/opt/MVS/lib/aarch64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 
 ./build-phase4/four_camera_capture \
   --config config/config.yaml \
   --encoder-cameras 4 \
-  --output rtp
+  --output srt
 ```
 
-正式 `build` 目录完成后应使用：
+正式构建目录使用：
 
 ```bash
 ./build/four_camera_capture \
   --config config/config.yaml \
   --encoder-cameras 4 \
-  --output rtp
+  --output srt
 ```
 
-不提供 `--duration` 时会持续运行。按 `Ctrl+C` 发送 SIGINT 正常停止。
+停止时先在 Jetson 按 `Ctrl+C`，等待相机和 GStreamer 正常释放，再停止接收端。不要使用 `kill -9`。
 
-### 7.5 其他输出模式
+## 5. 运行时验收
 
-纯性能测试，编码结果丢弃：
+### 5.1 Jetson 日志
+
+正常运行时关注：
+
+- Capture：四路约 60 FPS，启动瞬态后 `invalid` 不应持续增长。
+- FrameGroup：输入约 60 FPS，输出约 45 FPS。
+- ISP：约 45 group/s，`isp_drop=0`、`errors=0`。
+- Encode：四路约 45 FPS、约 2 Mbps，`queue_drop=0`、`encoder_drop=0`、`errors=0`。
+- Network：四路 `queue=0/2`、`drop=0`、`errors=0`。
+- Metadata：随输出 FrameGroup 增长，`drop=0`、`errors=0`。
+
+SRT 原生统计至少应满足：
+
+```text
+negotiated-latency-ms=(int)250
+send-rate-mbps≈2
+bytes-sent-dropped=(guint64)0
+packets-sent-dropped=(int)0
+```
+
+少量 `packets-sent-lost` 在已成功 retransmit 且 sent-dropped 仍为 0 时不等于画面已经损坏。持续增长的 NACK、RTT、重传或 sent-dropped 表示网络无法在 latency 窗口内恢复。
+
+### 5.2 接收端
+
+至少确认：
+
+1. 四路均能建立 SRT 连接并持续解码。
+2. Front/Rear/Left/Right 映射正确。
+3. 无规则竖向拉伸、错行或块状内存错位。
+4. 无 ERROR/EOS，接收进程持续运行。
+5. 快速运动时没有因丢失参考帧造成持续马赛克。
+
+当前 2 Mbps/路是为现有 Wi-Fi 吞吐和时延做出的取舍。静态画面通常清晰，快速运动区域的纹理和边缘会比原 20 Mbps 配置更软。若需要同时提高画质和稳定性，应优先使用千兆有线网络，而不是继续增大 SRT latency。
+
+## 6. SVMD v1 Metadata
+
+Metadata 本次未迁移到 SRT，仍由 Jetson 发往 UDP 5100。每个输出 FrameGroup 一包，固定 136 字节，所有多字节整数使用 network byte order。
+
+### 6.1 头部
+
+| 字节偏移 | 大小 | 类型 | 字段 | 说明 |
+|---:|---:|---|---|---|
+| 0 | 4 | uint32 | magic | `0x53564D44`，ASCII `SVMD` |
+| 4 | 2 | uint16 | version | 当前为 1 |
+| 6 | 2 | uint16 | packet_size | 当前为 136 |
+| 8 | 8 | uint64 | group_id | 当前实现等于 `trigger_cycle` |
+| 16 | 8 | uint64 | trigger_cycle | Software Trigger 周期号 |
+| 24 | 8 | int64 | group_timestamp | Jetson steady-clock ns |
+| 32 | 4 | uint32 | rtp_timestamp | 兼容字段，由 group timestamp 换算到 90 kHz |
+| 36 | 4 | uint32 | reserved | 当前为 0 |
+
+`group_timestamp` 不是 Unix epoch，不能直接与接收电脑的系统时间相减。
+
+90 kHz 换算规则：
+
+```text
+seconds   = group_timestamp_ns / 1_000_000_000
+remainder = group_timestamp_ns % 1_000_000_000
+rtp_timestamp = (seconds * 90_000
+                 + remainder * 90_000 / 1_000_000_000) mod 2^32
+```
+
+### 6.2 四路帧记录
+
+偏移 40 开始按 Front、Rear、Left、Right 固定放置 4 个 24 字节记录：
+
+| 相机 | 记录偏移 | frame_number | device_timestamp | host_timestamp |
+|---|---:|---:|---:|---:|
+| Front | 40 | 40 | 48 | 56 |
+| Rear | 64 | 64 | 72 | 80 |
+| Left | 88 | 88 | 96 | 104 |
+| Right | 112 | 112 | 120 | 128 |
+
+每个记录由三个 64 位字段组成：
+
+```text
+uint64 frame_number
+uint64 device_timestamp
+int64  host_timestamp
+```
+
+接收端至少检查 payload 长度、magic、version 和 packet_size；未知版本应丢弃，不应按 v1 强制解析。
+
+当前 `receive_four_grid_srt.sh` 只做视频预览，不消费 metadata。旧的 `verify_loopback_sync.py` 验证的是 RTP marker/timestamp 与 metadata 的映射，不应直接当作 SRT/MPEG-TS 正式组帧验收。正式服务器若需要在 SRT 链路恢复四路 FrameGroup，必须先验证 MPEG-TS PTS 保留规则，并为解码帧保留可追踪的时间戳 side data。
+
+查看 metadata：
 
 ```bash
-./build-phase4/four_camera_capture --config config/config.yaml \
-  --encoder-cameras 4 --output null
+python3 scripts/receive_metadata.py --bind 0.0.0.0 --port 5100
 ```
 
-保存四路裸 H.264：
+## 7. 兼容输出
+
+程序支持：
+
+```text
+--output null
+--output file
+--output rtp
+--output srt
+```
+
+- `srt`：当前默认。
+- `rtp`：保留的 H.264/H.265 RTP/UDP 路径。
+- `file`：保存裸编码流。
+- `null`：编码后丢弃，用于隔离网络问题。
+
+AV1 实验路径使用 `nvv4l2av1enc`。当前 Jetson GStreamer 的 `mpegtsmux` 不接受 AV1，因此 SRT AV1 使用 streamable Matroska；实测 Matroska 在有字节缺口时可能报 large block/corrupt stream 并终止 demux。当前网络交付应保持 H.265/MPEG-TS。
+
+## 8. 故障排查
+
+### SRT 无连接或无画面
+
+1. 确认电脑 listener 已先启动。
+2. 检查 `server_ip` 是否为接收电脑当前 IPv4。
+3. 用 `ip route get 192.168.3.93` 检查 Jetson 路由。
+4. 检查 UDP 5000/5002/5004/5006 防火墙规则。
+5. 检查 `srtsink`/`srtsrc`、`mpegtsmux`/`tsdemux` 与 H.265 插件。
+
+### 画面卡顿或运动时马赛克
+
+先看 SRT 原生统计，不要先修改相机、USB、ISP 或编码架构：
+
+- `packets-sent-dropped` / `bytes-sent-dropped` 增长：吞吐不足或数据超过 SRT latency 窗口。
+- RTT/NACK/重传剧增：Wi-Fi 抖动或丢包。
+- 发送端 Network queue drop 增长：应用层无法及时送入 SRT。
+- 所有发送统计正常但单路仍损坏：再隔离单路 `srtsrc -> tsdemux -> h265parse -> decoder -> sink`。
+
+当前 250 ms latency 基于约 2 Mbps/路且低 RTT 的现场状态。若网络环境恶化，可同时提高发送端与接收端 latency；只改一端会使实际协商结果难以判断。
+
+### 延迟较大
+
+编码阶段通常只有毫秒级延迟。端到端约 2～3 秒时首先检查 `negotiated-latency-ms` 是否仍为旧的 2000，而不是先归因于编码器。修改配置和脚本后必须重启两端。
+
+### 相机打开失败 `0x80000203`
+
+通常表示相机仍被旧进程占用：
 
 ```bash
-./build-phase4/four_camera_capture --config config/config.yaml \
-  --duration 10 --encoder-cameras 4 --output file
+pgrep -af four_camera_capture
 ```
 
-默认输出到 `encoded/front.h264`、`rear.h264`、`left.h264`、`right.h264`。
+先正常停止旧进程，再重新启动；不要反复并行启动多个采集程序。
 
-## 8. 启动和停止顺序
+### 四宫格格式异常
 
-推荐启动顺序：
+当前脚本在进入 compositor 前将四路统一为 system-memory I420，并为每路设置独立 leaky queue。不要绕过显式 raw caps，或直接把不同 GPU memory/caps 的解码输出混入 compositor。
 
-1. 确认服务器 IP、路由和防火墙。
-2. 服务器绑定 metadata 和四路 RTP 端口。
-3. 服务器启动解码、RTP timestamp side-data 和组帧缓存。
-4. Jetson 启动四路采集/发送。
-5. 检查 Jetson 每秒日志和服务器组帧成功率。
+## 9. 关联文件
 
-推荐停止顺序：
-
-1. 向 Jetson 进程发送 SIGINT/SIGTERM，等待 `Four-camera capture stopped cleanly.`
-2. 服务器等待短暂 drain timeout，丢弃仍不完整的组。
-3. 停止服务器接收器。
-
-不建议用 `kill -9`，因为这会跳过 Camera/GStreamer 正常释放。
-
-## 9. 运行时健康指标
-
-Jetson 日志每秒输出以下统计：
-
-- Capture：每路约 98–100 FPS，`drop/timeout/grab_error/invalid` 不应持续增长。
-- FrameGroup：`output_fps` 约 79–80，`sync_cycle_gap` 不应持续增长。
-- ISP：`group_fps` 约 80，`isp_drop=0`，队列不持续满。
-- Encode：每路约 79–80 FPS，`queue_drop=0 encoder_drop=0 errors=0`。
-- Network：每路 `sent` 持续增长，`drop=0 errors=0`。
-- Metadata：`sent` 约每秒增长 80，`drop=0 errors=0`。
-
-当前 640×480 实测：
-
-- 四路 ISP 平均约 0.8 ms/帧，P95 约 1.3 ms。
-- 四路 H.264 编码平均约 8–9 ms，P95 约 13–15 ms。
-- FrameGroup timestamp 到 RTP appsrc 成功接收平均约 17–18 ms，P95 约 28 ms。
-- Jetson 到 Ubuntu 服务器局域网实测：约 639 metadata 组，四路已收帧与 metadata 映射率 100%。
-
-服务器至少应监控：
-
-- 每路 RTP packet/marker-frame 接收率、sequence gap、jitterbuffer 丢包和延迟。
-- 每路解码 FPS/错误/耗时。
-- Metadata 包率、无效包、重复包和 `group_id` 间隙。
-- 完整四路组率、超时组率，以及每路缺帧数。
-- 接收、解码和组帧缓存深度；不允许无界增长。
-- CPU/GPU/RAM 和网卡 drop/error 计数。
-
-## 10. 故障排查
-
-### 服务器完全收不到 UDP
-
-```bash
-hostname -I
-sudo tcpdump -ni any udp port 5000
-```
-
-检查：
-
-- Jetson `config/config.yaml` 中 `server_ip` 是否为正确服务器 IP。
-- 修改 IP 后是否已重启 Jetson 进程。
-- Jetson 到服务器的路由：`ip route get <SERVER_IPV4>`。
-- 服务器防火墙与 VLAN/Wi-Fi 客户端隔离。
-
-### 有 UDP，但 GStreamer 不出图
-
-检查：
-
-- 是否显式设置了 H.264 RTP caps。
-- `h264parse`、`rtph264depay` 和解码器插件是否安装。
-- 服务器不是 Jetson 时，不要盲目使用 `nvv4l2decoder`；通用 Ubuntu 可先用 `avdec_h264` 验证。
-- 等待下一次 SPS/PPS/IDR，通常不超过约 1 秒。
-
-### 四宫格不出窗口或收到 EOS
-
-- 先单独验证 5000/5002/5004/5006 都能解码。
-- 使用仓库中已验证的 `scripts/receive_four_grid.sh`。
-- 不要为当前脚本添加 `compositor ignore-inactive-pads=true`；在所有 live pad 首帧到达前，
-  该选项可能导致立即 EOS。
-- 确认 X11 环境下 `DISPLAY` 有效，并用 `videotestsrc ! videoconvert ! xvimagesink` 验证显示。
-
-### 有视频，但无法组四路帧
-
-- 确认 UDP 5100 有 136 字节 SVMD 数据报。
-- 确认解码通路保留了原始 RTP timestamp，而不是仅保留服务器生成的显示 PTS。
-- 确认按无符号 32 位值匹配，并正确处理时间戳回绕。
-- 运行 `verify_loopback_sync.py`隔离验证协议层，但不要与正式接收程序同时绑定端口。
-
-## 11. 实现边界与后续工作
-
-当前 NX 路径不是 zero-copy：MVS buffer 复制到 host Bayer 池，上传 CUDA，
-NV12 回传 host，再复制进 GStreamer/NVMM；编码 AU 也会经过 host 共享 buffer 和 RTP appsrc 复制。
-所有队列有界且满时丢旧帧，设计优先级是 freshness 高于 completeness。
-
-正式上线前尚需：
-
-1. 在 4×1440×1080@80 FPS 配置下重新验证 USB、ISP、编码、网络和服务器解码性能。
-2. 完成至少 30 分钟连续稳定性测试，检查内存增长、死锁、队列积压和网络丢包。
-3. 确认正式服务器硬件解码能力和四路 80 FPS 组帧/算法通吐。
-4. 如果跨不可信网络，在 RTP/UDP 之外设计认证、加密和可观测性机制。
-5. 如果服务器要产生可与外部时钟对齐的时间，另行引入 PTP/NTP 时钟模型；
-   不要把当前 steady-clock ns 当成 Unix epoch。
-
-## 12. 关联文件
-
-- `config/config.yaml`：Jetson 采集、ISP、编码、目标 IP 和端口配置。
-- `src/network/streamer.cpp`：RTP payloader/UDP 实现。
-- `src/network/metadata_sender.hpp/.cpp`：SVMD v1 常量、时间戳换算和序列化。
-- `tests/metadata_wire_test.cpp`：metadata 协议单元测试。
-- `scripts/receive_metadata.py`：参考解析器。
-- `scripts/verify_loopback_sync.py`：RTP marker timestamp 与 metadata 映射验收器。
-- `scripts/receive_four_grid.sh`：Ubuntu/X11 四路联调预览。
-- `README.md`：项目总览、构建与当前实测结果。
+- `config/config.yaml`：当前采集、USB、编码和网络基线。
+- `src/encoding/gstreamer_encoder.cpp`：H.264/H.265/AV1 Jetson 编码 pipeline。
+- `src/network/streamer.cpp`：null/file/RTP/SRT 输出与 SRT 统计。
+- `src/network/metadata_sender.cpp`：SVMD v1 发送。
+- `scripts/receive_four_grid_srt.sh`：当前 H.265/SRT 四宫格接收。
+- `scripts/receive_four_grid.sh`：旧 RTP 四宫格接收。
+- `scripts/receive_metadata.py`：metadata 参考解析器。
+- `scripts/verify_loopback_sync.py`：旧 RTP/metadata 映射验证器。
+- `README.md`：项目总览与启动流程。

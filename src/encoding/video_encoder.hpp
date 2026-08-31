@@ -11,6 +11,7 @@
 enum class VideoCodec {
     H264,
     H265,
+    AV1,
 };
 
 const char *VideoCodecName(VideoCodec codec) noexcept;

@@ -27,13 +27,19 @@ const char *CameraName(CameraId camera_id)
 
 const char *VideoCodecName(VideoCodec codec) noexcept
 {
-    return codec == VideoCodec::H264 ? "h264" : "h265";
+    switch (codec) {
+        case VideoCodec::H264: return "h264";
+        case VideoCodec::H265: return "h265";
+        case VideoCodec::AV1: return "av1";
+    }
+    return "unknown";
 }
 
 VideoCodec ParseVideoCodec(const std::string &name)
 {
     if (name == "h264") return VideoCodec::H264;
     if (name == "h265") return VideoCodec::H265;
+    if (name == "av1") return VideoCodec::AV1;
     throw std::invalid_argument("unsupported codec: " + name);
 }
 
@@ -59,13 +65,20 @@ GStreamerEncoder::~GStreamerEncoder()
 
 bool GStreamerEncoder::buildPipeline(std::string *error)
 {
+    const bool av1 = config_.codec == VideoCodec::AV1;
     const char *encoder = config_.codec == VideoCodec::H264
                               ? "nvv4l2h264enc"
-                              : "nvv4l2h265enc";
-    const char *parser = config_.codec == VideoCodec::H264 ? "h264parse" : "h265parse";
+                              : (config_.codec == VideoCodec::H265
+                                     ? "nvv4l2h265enc"
+                                     : "nvv4l2av1enc");
+    const char *parser = config_.codec == VideoCodec::H264
+                             ? "h264parse"
+                             : (config_.codec == VideoCodec::H265 ? "h265parse" : "av1parse");
     const char *encoded_caps = config_.codec == VideoCodec::H264
                                    ? "video/x-h264"
-                                   : "video/x-h265";
+                                   : (config_.codec == VideoCodec::H265
+                                          ? "video/x-h265"
+                                          : "video/x-av1");
 
     std::ostringstream description;
     description
@@ -79,10 +92,13 @@ bool GStreamerEncoder::buildPipeline(std::string *error)
         << " bitrate=" << config_.bitrate
         << " iframeinterval=" << config_.gop
         << " idrinterval=" << config_.gop
-        << " insert-sps-pps=true copy-timestamp=true maxperf-enable=true"
-        << " control-rate=1 num-B-Frames=0 "
-        << "! " << parser << " config-interval=-1 "
-        << "! " << encoded_caps << ",stream-format=byte-stream,alignment=au "
+        << (av1 ? " insert-seq-hdr=true" : " insert-sps-pps=true")
+        << " copy-timestamp=true maxperf-enable=true control-rate=1 "
+        << (av1 ? "" : "num-B-Frames=0 ")
+        << "! " << parser << (av1 ? " " : " config-interval=-1 ")
+        << "! " << encoded_caps
+        << (av1 ? ",stream-format=obu-stream,alignment=tu "
+                : ",stream-format=byte-stream,alignment=au ")
         << "! appsink name=output emit-signals=false sync=false max-buffers="
         << config_.queue_depth << " drop=true";
 

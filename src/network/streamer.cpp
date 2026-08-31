@@ -389,6 +389,9 @@ public:
 private:
     std::string buildPipelineDescription() const override
     {
+        if (config().codec == VideoCodec::AV1) {
+            throw std::invalid_argument("AV1 is supported only by SRT/file output");
+        }
         const bool h264 = config().codec == VideoCodec::H264;
         std::ostringstream pipeline_description;
         pipeline_description
@@ -418,6 +421,21 @@ public:
 private:
     std::string buildPipelineDescription() const override
     {
+        if (config().codec == VideoCodec::AV1) {
+            std::ostringstream pipeline_description;
+            pipeline_description
+                << "appsrc name=input is-live=true format=time do-timestamp=false block=false "
+                << "caps=video/x-av1,stream-format=obu-stream,alignment=tu "
+                << "! queue max-size-buffers=" << config().queue_depth
+                << " max-size-bytes=0 max-size-time=0 leaky=downstream "
+                << "! av1parse "
+                << "! matroskamux streamable=true "
+                << "! srtsink name=transport_sink uri=\"srt://" << config().server_ip
+                << ':' << config().port
+                << "?mode=caller&latency=" << config().srt_latency_ms << "\" "
+                << "wait-for-connection=false sync=false async=false";
+            return pipeline_description.str();
+        }
         const bool h264 = config().codec == VideoCodec::H264;
         std::ostringstream pipeline_description;
         pipeline_description
@@ -480,7 +498,9 @@ MultiStreamOutput::MultiStreamOutput(MultiStreamOutputConfig config)
         throw std::invalid_argument("stream output camera count and queue depth are invalid");
     }
     const std::array<const char *, 4> names = {"front", "rear", "left", "right"};
-    const char *extension = config_.codec == VideoCodec::H264 ? ".h264" : ".h265";
+    const char *extension = config_.codec == VideoCodec::H264
+                                ? ".h264"
+                                : (config_.codec == VideoCodec::H265 ? ".h265" : ".av1");
     for (std::size_t index = 0; index < config_.active_camera_count; ++index) {
         StreamerConfig stream;
         stream.mode = config_.mode;

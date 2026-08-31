@@ -5,7 +5,7 @@ display_sink="${VIDEO_SINK:-ximagesink}"
 video_decoder="${VIDEO_DECODER:-}"
 
 if [[ -z "${video_decoder}" ]]; then
-  for candidate in nvh264dec vah264dec avdec_h264; do
+  for candidate in nvh265dec vah265dec avdec_h265; do
     if gst-inspect-1.0 "${candidate}" >/dev/null 2>&1; then
       video_decoder="${candidate}"
       break
@@ -13,7 +13,7 @@ if [[ -z "${video_decoder}" ]]; then
   done
 fi
 if [[ -z "${video_decoder}" ]] || ! gst-inspect-1.0 "${video_decoder}" >/dev/null 2>&1; then
-  echo "No usable H.264 decoder found: ${video_decoder:-none}" >&2
+  echo "No usable H.265 decoder found: ${video_decoder:-none}" >&2
   exit 1
 fi
 
@@ -27,23 +27,23 @@ exec gst-launch-1.0 \
     sink_3::xpos=720 sink_3::ypos=540 sink_3::width=720 sink_3::height=540 \
   ! video/x-raw,width=1440,height=1080,framerate=60/1 \
   ! videoconvert ! "${display_sink}" sync=false \
-  srtsrc uri="srt://0.0.0.0:5000?mode=listener&latency=500" \
-  ! tsdemux ! h264parse ! "${video_decoder}" \
+  srtsrc uri="srt://0.0.0.0:5000?mode=listener&latency=250" \
+  ! tsdemux ! h265parse ! "${video_decoder}" \
   ! videoconvert ! videoscale ! videorate ! video/x-raw,format=I420,width=1440,height=1080,framerate=60/1 \
   ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
   ! mix.sink_0 \
-  srtsrc uri="srt://0.0.0.0:5002?mode=listener&latency=500" \
-  ! tsdemux ! h264parse ! "${video_decoder}" \
+  srtsrc uri="srt://0.0.0.0:5002?mode=listener&latency=250" \
+  ! tsdemux ! h265parse ! "${video_decoder}" \
   ! videoconvert ! videoscale ! videorate ! video/x-raw,format=I420,width=1440,height=1080,framerate=60/1 \
   ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
   ! mix.sink_1 \
-  srtsrc uri="srt://0.0.0.0:5004?mode=listener&latency=500" \
-  ! tsdemux ! h264parse ! "${video_decoder}" \
+  srtsrc uri="srt://0.0.0.0:5004?mode=listener&latency=250" \
+  ! tsdemux ! h265parse ! "${video_decoder}" \
   ! videoconvert ! videoscale ! videorate ! video/x-raw,format=I420,width=1440,height=1080,framerate=60/1 \
   ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
   ! mix.sink_2 \
-  srtsrc uri="srt://0.0.0.0:5006?mode=listener&latency=500" \
-  ! tsdemux ! h264parse ! "${video_decoder}" \
+  srtsrc uri="srt://0.0.0.0:5006?mode=listener&latency=250" \
+  ! tsdemux ! h265parse ! "${video_decoder}" \
   ! videoconvert ! videoscale ! videorate ! video/x-raw,format=I420,width=1440,height=1080,framerate=60/1 \
   ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
   ! mix.sink_3
