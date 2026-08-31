@@ -12,6 +12,7 @@ enum class OutputMode {
     NULL_OUTPUT,
     FILE_OUTPUT,
     RTP_UDP,
+    SRT,
 };
 
 const char *OutputModeName(OutputMode mode) noexcept;
@@ -24,6 +25,7 @@ struct StreamerConfig {
     std::uint16_t port = 0;
     std::uint8_t payload_type = 96;
     std::uint32_t mtu = 1400;
+    std::uint32_t srt_latency_ms = 120;
     std::size_t queue_depth = 2;
     std::string file_path;
 };
@@ -38,6 +40,7 @@ struct StreamerStatistics {
     double average_end_to_end_latency_ms = 0.0;
     double p95_end_to_end_latency_ms = 0.0;
     double max_end_to_end_latency_ms = 0.0;
+    std::string transport_stats;
 };
 
 class IStreamer {
@@ -58,6 +61,7 @@ struct MultiStreamOutputConfig {
     std::array<std::uint16_t, 4> ports = {5000, 5002, 5004, 5006};
     std::uint8_t payload_type = 96;
     std::uint32_t mtu = 1400;
+    std::uint32_t srt_latency_ms = 120;
     std::size_t queue_depth = 2;
     std::size_t active_camera_count = 4;
     std::string file_directory = "encoded";

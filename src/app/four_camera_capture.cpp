@@ -2,11 +2,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -74,8 +76,8 @@ TriggerMode ParseTriggerMode(const std::string &value)
 
 struct AppConfig {
     MultiCameraManagerConfig manager;
-    double software_frequency_hz = 100.0;
-    double output_fps = 80.0;
+    double software_frequency_hz = 60.0;
+    double output_fps = 60.0;
     bool isp_enabled = true;
     IspPipelineConfig isp;
     bool encoder_enabled = true;
@@ -113,6 +115,11 @@ AppConfig LoadConfig(const std::string &path)
     result.manager.camera_parameters.width = image["width"].as<std::uint32_t>();
     result.manager.camera_parameters.height = image["height"].as<std::uint32_t>();
     result.manager.camera_parameters.frame_rate = image["frame_rate"].as<float>();
+    const double capture_fps = result.manager.camera_parameters.frame_rate;
+    if (!std::isfinite(capture_fps) || capture_fps <= 0.0 || capture_fps > 249.0) {
+        throw std::runtime_error("capture frame_rate must be between 0 and 249 FPS");
+    }
+    const double frame_period_us = 1'000'000.0 / capture_fps;
     const std::string pixel_format = image["pixel_format"].as<std::string>();
     if (pixel_format != "BayerRG8") {
         throw std::runtime_error("capture pixel_format must be BayerRG8");
@@ -129,15 +136,15 @@ AppConfig LoadConfig(const std::string &path)
     result.manager.camera_parameters.gain_auto = capture["gain_auto"].as<bool>();
     if (result.manager.camera_parameters.exposure_auto &&
         (result.manager.camera_parameters.auto_exposure_upper_limit_us <= 0.0F ||
-         result.manager.camera_parameters.auto_exposure_upper_limit_us >= 10000.0F)) {
+         result.manager.camera_parameters.auto_exposure_upper_limit_us >= frame_period_us)) {
         throw std::runtime_error(
-            "100 FPS requires auto_exposure_upper_limit_us between 0 and 10000");
+            "auto_exposure_upper_limit_us must be positive and shorter than one frame period");
     }
     if (!result.manager.camera_parameters.exposure_auto &&
         (result.manager.camera_parameters.exposure_time_us <= 0.0F ||
-         result.manager.camera_parameters.exposure_time_us > 10000.0F)) {
+         result.manager.camera_parameters.exposure_time_us > frame_period_us)) {
         throw std::runtime_error(
-            "100 FPS requires exposure_time_us between 0 and 10000");
+            "exposure_time_us must be positive and no longer than one frame period");
     }
     if (result.manager.camera_parameters.auto_brightness_target > 255U) {
         throw std::runtime_error("auto_brightness_target must be between 0 and 255");
@@ -156,6 +163,13 @@ AppConfig LoadConfig(const std::string &path)
     if (result.software_frequency_hz <= 0.0) {
         throw std::runtime_error("software_frequency_hz must be positive");
     }
+    if (result.manager.camera_parameters.trigger_mode == TriggerMode::SOFTWARE_TRIGGER &&
+        std::abs(result.software_frequency_hz - capture_fps) >
+            std::numeric_limits<double>::epsilon() * std::max(result.software_frequency_hz,
+                                                               capture_fps) * 4.0) {
+        throw std::runtime_error(
+            "software_frequency_hz must equal capture frame_rate in SOFTWARE_TRIGGER mode");
+    }
 
     const YAML::Node buffering = config["buffering"];
     if (buffering["frames_per_camera"].as<std::size_t>() != FrameBuffer::kCapacity) {
@@ -164,6 +178,25 @@ AppConfig LoadConfig(const std::string &path)
     result.manager.grab_timeout_ms = buffering["grab_timeout_ms"].as<unsigned int>();
     if (result.manager.grab_timeout_ms == 0) {
         throw std::runtime_error("grab_timeout_ms must be positive");
+    }
+    result.manager.camera_parameters.usb_transfer_size =
+        buffering["usb_transfer_size"].as<std::uint32_t>();
+    result.manager.camera_parameters.usb_transfer_ways =
+        buffering["usb_transfer_ways"].as<std::uint32_t>();
+    result.manager.camera_parameters.sdk_image_nodes =
+        buffering["sdk_image_nodes"].as<std::uint32_t>();
+    if (buffering["device_link_throughput_limit_bps"]) {
+        result.manager.camera_parameters.device_link_throughput_limit_bps =
+            buffering["device_link_throughput_limit_bps"].as<std::uint32_t>();
+    }
+    if (result.manager.camera_parameters.usb_transfer_size < 1024U ||
+        result.manager.camera_parameters.usb_transfer_size > 2U * 1024U * 1024U ||
+        result.manager.camera_parameters.usb_transfer_ways == 0U ||
+        result.manager.camera_parameters.usb_transfer_ways > 10U ||
+        result.manager.camera_parameters.sdk_image_nodes == 0U ||
+        result.manager.camera_parameters.sdk_image_nodes > 64U) {
+        throw std::runtime_error(
+            "USB transfer size must be 1 KiB..2 MiB, ways 1..10, and SDK nodes 1..64");
     }
 
     const YAML::Node processing = config["processing"];
@@ -245,6 +278,9 @@ AppConfig LoadConfig(const std::string &path)
     result.output.server_ip = network["server_ip"].as<std::string>();
     result.output.payload_type = network["payload_type"].as<std::uint8_t>();
     result.output.mtu = network["mtu"].as<std::uint32_t>();
+    if (network["srt_latency_ms"]) {
+        result.output.srt_latency_ms = network["srt_latency_ms"].as<std::uint32_t>();
+    }
     result.output.ports = {
         streams["front_port"].as<std::uint16_t>(),
         streams["rear_port"].as<std::uint16_t>(),
@@ -263,10 +299,9 @@ AppConfig LoadConfig(const std::string &path)
     if (result.manager.camera_parameters.width == 0 ||
         result.manager.camera_parameters.height == 0 ||
         result.manager.camera_parameters.width > 1440 ||
-        result.manager.camera_parameters.height > 1080 ||
-        result.manager.camera_parameters.frame_rate != 100.0F) {
+        result.manager.camera_parameters.height > 1080) {
         throw std::runtime_error(
-            "image size must be within 1440x1080 and frame rate must be 100 FPS");
+            "image size must be within 1440x1080");
     }
     return result;
 }
@@ -304,12 +339,12 @@ void PrintUsage(const char *program)
         << "  --open-all-only         Step3: open four configured cameras, then close\n"
         << "  --duration SECONDS      Run four-thread capture for a fixed duration\n"
         << "  --preview               Show a four-camera preview; press Q or Esc to stop\n"
-        << "  --disable-isp           Stop after the 80 FPS FrameRateSelector\n"
+        << "  --disable-isp           Stop after the configured FrameRateSelector\n"
         << "  --isp-cameras N         Process 1, 2, 3, or 4 cameras for benchmarking\n"
         << "  --isp-dump-dir PATH     Save the first processed group as raw NV12 files\n"
         << "  --disable-encoder       Stop after ISP\n"
         << "  --encoder-cameras N     Encode 1, 2, 3, or 4 streams; also sets ISP count\n"
-        << "  --output MODE           null, file, or rtp (RTP/UDP)\n"
+        << "  --output MODE           null, file, rtp (RTP/UDP), or srt\n"
         << "  --config PATH           Use an alternate YAML configuration\n"
         << "  --help                  Show this message\n";
 }
@@ -584,7 +619,9 @@ public:
         }
 
         std::unique_ptr<MetadataSender> metadata_sender;
-        if (config.encoder_enabled && config.output.mode == OutputMode::RTP_UDP &&
+        if (config.encoder_enabled &&
+            (config.output.mode == OutputMode::RTP_UDP ||
+             config.output.mode == OutputMode::SRT) &&
             config.metadata_enabled) {
             std::string error;
             metadata_sender = std::make_unique<MetadataSender>(config.metadata);
@@ -714,7 +751,7 @@ public:
             }
 
             // This is the downstream consumer cadence, not a camera-thread
-            // delay. Four 4-deep rings retain roughly 40 ms at 100 FPS.
+            // delay. Four-frame rings retain several capture periods.
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             const auto now = std::chrono::steady_clock::now();
             const double runtime = std::chrono::duration<double>(now - run_start).count();
@@ -854,6 +891,11 @@ public:
                         output_stats[index].average_end_to_end_latency_ms,
                         output_stats[index].p95_end_to_end_latency_ms,
                         output_stats[index].max_end_to_end_latency_ms);
+                    if (!output_stats[index].transport_stats.empty()) {
+                        spdlog::info("SRT {} stats={}",
+                                     CameraName(camera_ids[index]),
+                                     output_stats[index].transport_stats);
+                    }
                 }
             }
             if (metadata_sender != nullptr) {

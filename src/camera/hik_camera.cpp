@@ -93,6 +93,36 @@ bool ConfigureTrigger(void *handle, TriggerMode mode, std::string *error)
     return SetEnum(handle, "TriggerSource", source, error);
 }
 
+bool ConfigureUsbTransport(void *handle,
+                           const HikCameraParameters &parameters,
+                           std::string *error)
+{
+    int ret = MV_USB_SetTransferSize(handle, parameters.usb_transfer_size);
+    if (ret != MV_OK) {
+        if (error != nullptr) {
+            *error = "set USB transfer size failed, ret=" + HexRet(ret);
+        }
+        return false;
+    }
+
+    ret = MV_USB_SetTransferWays(handle, parameters.usb_transfer_ways);
+    if (ret != MV_OK) {
+        if (error != nullptr) {
+            *error = "set USB transfer ways failed, ret=" + HexRet(ret);
+        }
+        return false;
+    }
+
+    ret = MV_CC_SetImageNodeNum(handle, parameters.sdk_image_nodes);
+    if (ret != MV_OK) {
+        if (error != nullptr) {
+            *error = "set SDK image node count failed, ret=" + HexRet(ret);
+        }
+        return false;
+    }
+    return true;
+}
+
 bool ConfigureCamera(void *handle, const HikCameraParameters &parameters, std::string *error)
 {
     if (!SetEnum(handle, "PixelFormat", static_cast<unsigned int>(parameters.pixel_format), error) ||
@@ -187,7 +217,11 @@ bool ConfigureCamera(void *handle, const HikCameraParameters &parameters, std::s
     return true;
 }
 
-void LogTransportReadback(void *handle, const std::string &serial)
+void LogTransportReadback(void *handle,
+                          const std::string &serial,
+                          int throughput_limit_mode_set_ret,
+                          std::uint32_t throughput_limit_requested,
+                          int throughput_limit_set_ret)
 {
     unsigned int transfer_size = 0;
     unsigned int transfer_ways = 0;
@@ -215,7 +249,10 @@ void LogTransportReadback(void *handle, const std::string &serial)
     const int resulting_rate_ret =
         MV_CC_GetFloatValue(handle, "ResultingFrameRate", &resulting_rate);
     spdlog::info(
-        "Camera transport serial={} payload={} throughput_limit={} exposure_us={:.1f} "
+        "Camera transport serial={} payload={} throughput_limit_mode_set_ret={} "
+        "throughput_limit_requested={} "
+        "throughput_limit_readback={} throughput_limit_set_ret={} throughput_limit_read_ret={} "
+        "exposure_us={:.1f} "
         "exposure_upper_us={} brightness={} brightness_range=[{},{}] "
         "gain={:.2f} gain_range=[{:.2f},{:.2f}] "
         "acquisition_fps={:.2f} resulting_fps={:.2f} "
@@ -223,7 +260,11 @@ void LogTransportReadback(void *handle, const std::string &serial)
         "readback_ret=[{},{},{},{},{},{},{},{},{},{}]",
         serial,
         payload_ret == MV_OK ? payload.nCurValue : 0U,
+        HexRet(throughput_limit_mode_set_ret),
+        throughput_limit_requested,
         throughput_ret == MV_OK ? throughput.nCurValue : 0U,
+        HexRet(throughput_limit_set_ret),
+        HexRet(throughput_ret),
         exposure_ret == MV_OK ? exposure.fCurValue : 0.0F,
         exposure_upper_ret == MV_OK ? exposure_upper.nCurValue : 0U,
         brightness_ret == MV_OK ? brightness.nCurValue : 0U,
@@ -370,15 +411,44 @@ bool HikCamera::open(const HikDeviceInfo &device,
 
     serial_ = device.serial;
     parameters_ = parameters;
-    if (!ConfigureCamera(handle_, parameters_, error)) {
+    if (!ConfigureUsbTransport(handle_, parameters_, error) ||
+        !ConfigureCamera(handle_, parameters_, error)) {
         close();
         return false;
     }
-    LogTransportReadback(handle_, serial_);
+    int throughput_limit_mode_set_ret = MV_OK;
+    int throughput_limit_set_ret = MV_OK;
+    if (parameters_.device_link_throughput_limit_bps > 0U) {
+        throughput_limit_mode_set_ret = MV_CC_SetEnumValueByString(
+            handle_, "DeviceLinkThroughputLimitMode", "On");
+        if (throughput_limit_mode_set_ret != MV_OK) {
+            spdlog::warn("DeviceLinkThroughputLimitMode set failed: serial={} ret={}",
+                         serial_,
+                         HexRet(throughput_limit_mode_set_ret));
+        } else {
+            throughput_limit_set_ret = MV_CC_SetIntValue(
+                handle_,
+                "DeviceLinkThroughputLimit",
+                parameters_.device_link_throughput_limit_bps);
+            if (throughput_limit_set_ret != MV_OK) {
+                spdlog::warn("DeviceLinkThroughputLimit set failed: serial={} requested={} ret={}",
+                             serial_,
+                             parameters_.device_link_throughput_limit_bps,
+                             HexRet(throughput_limit_set_ret));
+            }
+        }
+    }
+    LogTransportReadback(handle_,
+                         serial_,
+                         throughput_limit_mode_set_ret,
+                         parameters_.device_link_throughput_limit_bps,
+                         throughput_limit_set_ret);
 
-    ret = MV_CC_SetGrabStrategy(handle_, MV_GrabStrategy_LatestImagesOnly);
+    // Capture every software-triggered frame in order. The application ring
+    // remains the bounded latest-frame buffer for downstream backpressure.
+    ret = MV_CC_SetGrabStrategy(handle_, MV_GrabStrategy_OneByOne);
     if (ret != MV_OK) {
-        if (error != nullptr) *error = "set latest-image grab strategy failed, ret=" + HexRet(ret);
+        if (error != nullptr) *error = "set one-by-one grab strategy failed, ret=" + HexRet(ret);
         close();
         return false;
     }

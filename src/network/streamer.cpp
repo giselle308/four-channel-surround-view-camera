@@ -195,48 +195,36 @@ private:
     EndToEndLatencyTracker latency_;
 };
 
-class RtpUdpStreamer final : public IStreamer {
+class GstAppSrcStreamer : public IStreamer {
 public:
-    explicit RtpUdpStreamer(StreamerConfig config)
-        : config_(std::move(config)), queue_(config_.queue_depth)
+    GstAppSrcStreamer(StreamerConfig config, std::string name)
+        : config_(std::move(config)), queue_(config_.queue_depth), name_(std::move(name))
     {
         gst_init(nullptr, nullptr);
     }
-    ~RtpUdpStreamer() override { stop(); }
+    ~GstAppSrcStreamer() override { stop(); }
 
     bool start(std::string *error) override
     {
-        const bool h264 = config_.codec == VideoCodec::H264;
-        std::ostringstream pipeline_description;
-        pipeline_description
-            << "appsrc name=input is-live=true format=time do-timestamp=false block=false "
-            << "caps=" << (h264 ? "video/x-h264" : "video/x-h265")
-            << ",stream-format=byte-stream,alignment=au "
-            << "! queue max-size-buffers=" << config_.queue_depth
-            << " max-size-bytes=0 max-size-time=0 leaky=downstream "
-            << "! " << (h264 ? "h264parse" : "h265parse") << " config-interval=-1 "
-            << "! " << (h264 ? "rtph264pay" : "rtph265pay")
-            << " pt=" << static_cast<unsigned int>(config_.payload_type)
-            << " config-interval=1 mtu=" << config_.mtu
-            << " timestamp-offset=0 seqnum-offset=0 "
-            << "! udpsink host=" << config_.server_ip
-            << " port=" << config_.port << " sync=false async=false";
-
+        const std::string pipeline_description = buildPipelineDescription();
         GError *gst_error = nullptr;
-        pipeline_ = gst_parse_launch(pipeline_description.str().c_str(), &gst_error);
+        pipeline_ = gst_parse_launch(pipeline_description.c_str(), &gst_error);
         if (pipeline_ == nullptr || gst_error != nullptr) {
             if (error != nullptr) {
-                *error = gst_error != nullptr ? gst_error->message : "RTP pipeline creation failed";
+                *error = gst_error != nullptr
+                             ? gst_error->message
+                             : name_ + " pipeline creation failed";
             }
             if (gst_error != nullptr) g_error_free(gst_error);
             stop();
             return false;
         }
         app_src_ = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(pipeline_), "input"));
+        stats_element_ = gst_bin_get_by_name(GST_BIN(pipeline_), "transport_sink");
         bus_ = gst_element_get_bus(pipeline_);
         if (app_src_ == nullptr || bus_ == nullptr ||
             gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            if (error != nullptr) *error = "RTP pipeline failed to enter PLAYING";
+            if (error != nullptr) *error = name_ + " pipeline failed to enter PLAYING";
             stop();
             return false;
         }
@@ -272,6 +260,10 @@ public:
             gst_object_unref(app_src_);
             app_src_ = nullptr;
         }
+        if (stats_element_ != nullptr) {
+            gst_object_unref(stats_element_);
+            stats_element_ = nullptr;
+        }
         if (pipeline_ != nullptr) {
             gst_object_unref(pipeline_);
             pipeline_ = nullptr;
@@ -288,8 +280,26 @@ public:
         result.errors = errors_.load(std::memory_order_relaxed);
         result.queue_size = queue_.size();
         latency_.populate(result);
+        if (stats_element_ != nullptr) {
+            GstStructure *stats = nullptr;
+            g_object_get(G_OBJECT(stats_element_), "stats", &stats, nullptr);
+            if (stats != nullptr) {
+                gchar *stats_text = gst_structure_to_string(stats);
+                if (stats_text != nullptr) {
+                    result.transport_stats = stats_text;
+                    g_free(stats_text);
+                }
+                gst_structure_free(stats);
+            }
+        }
         return result;
     }
+
+private:
+    virtual std::string buildPipelineDescription() const = 0;
+
+protected:
+    const StreamerConfig &config() const noexcept { return config_; }
 
 private:
     void run(std::stop_token token)
@@ -335,12 +345,14 @@ private:
             if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
                 gst_message_parse_error(message, &error, &debug);
                 errors_.fetch_add(1, std::memory_order_relaxed);
-                spdlog::error("RTP streamer error: {} debug={}",
+                spdlog::error("{} streamer error: {} debug={}",
+                              name_,
                               error != nullptr ? error->message : "unknown",
                               debug != nullptr ? debug : "");
             } else {
                 gst_message_parse_warning(message, &error, &debug);
-                spdlog::warn("RTP streamer warning: {} debug={}",
+                spdlog::warn("{} streamer warning: {} debug={}",
+                             name_,
                              error != nullptr ? error->message : "unknown",
                              debug != nullptr ? debug : "");
             }
@@ -357,12 +369,70 @@ private:
     GstElement *pipeline_ = nullptr;
     GstAppSrc *app_src_ = nullptr;
     GstBus *bus_ = nullptr;
+    GstElement *stats_element_ = nullptr;
     std::atomic<std::uint64_t> submitted_{0};
     std::atomic<std::uint64_t> sent_{0};
     std::atomic<std::uint64_t> bytes_{0};
     std::atomic<std::uint64_t> drops_{0};
     std::atomic<std::uint64_t> errors_{0};
     EndToEndLatencyTracker latency_;
+    std::string name_;
+};
+
+class RtpUdpStreamer final : public GstAppSrcStreamer {
+public:
+    explicit RtpUdpStreamer(StreamerConfig config)
+        : GstAppSrcStreamer(std::move(config), "RTP")
+    {
+    }
+
+private:
+    std::string buildPipelineDescription() const override
+    {
+        const bool h264 = config().codec == VideoCodec::H264;
+        std::ostringstream pipeline_description;
+        pipeline_description
+            << "appsrc name=input is-live=true format=time do-timestamp=false block=false "
+            << "caps=" << (h264 ? "video/x-h264" : "video/x-h265")
+            << ",stream-format=byte-stream,alignment=au "
+            << "! queue max-size-buffers=" << config().queue_depth
+            << " max-size-bytes=0 max-size-time=0 leaky=downstream "
+            << "! " << (h264 ? "h264parse" : "h265parse") << " config-interval=-1 "
+            << "! " << (h264 ? "rtph264pay" : "rtph265pay")
+            << " pt=" << static_cast<unsigned int>(config().payload_type)
+            << " config-interval=1 mtu=" << config().mtu
+            << " timestamp-offset=0 seqnum-offset=0 "
+            << "! udpsink host=" << config().server_ip
+            << " port=" << config().port << " sync=false async=false";
+        return pipeline_description.str();
+    }
+};
+
+class SrtStreamer final : public GstAppSrcStreamer {
+public:
+    explicit SrtStreamer(StreamerConfig config)
+        : GstAppSrcStreamer(std::move(config), "SRT")
+    {
+    }
+
+private:
+    std::string buildPipelineDescription() const override
+    {
+        const bool h264 = config().codec == VideoCodec::H264;
+        std::ostringstream pipeline_description;
+        pipeline_description
+            << "appsrc name=input is-live=true format=time do-timestamp=false block=false "
+            << "caps=" << (h264 ? "video/x-h264" : "video/x-h265")
+            << ",stream-format=byte-stream,alignment=au "
+            << "! queue max-size-buffers=" << config().queue_depth
+            << " max-size-bytes=0 max-size-time=0 leaky=downstream "
+            << "! " << (h264 ? "h264parse" : "h265parse") << " config-interval=-1 "
+            << "! mpegtsmux alignment=7 "
+            << "! srtsink name=transport_sink uri=\"srt://" << config().server_ip << ':' << config().port
+            << "?mode=caller&latency=" << config().srt_latency_ms << "\" "
+            << "wait-for-connection=false sync=false async=false";
+        return pipeline_description.str();
+    }
 };
 
 }  // namespace
@@ -373,6 +443,7 @@ const char *OutputModeName(OutputMode mode) noexcept
         case OutputMode::NULL_OUTPUT: return "null";
         case OutputMode::FILE_OUTPUT: return "file";
         case OutputMode::RTP_UDP: return "rtp";
+        case OutputMode::SRT: return "srt";
     }
     return "unknown";
 }
@@ -382,6 +453,7 @@ OutputMode ParseOutputMode(const std::string &name)
     if (name == "null") return OutputMode::NULL_OUTPUT;
     if (name == "file") return OutputMode::FILE_OUTPUT;
     if (name == "rtp") return OutputMode::RTP_UDP;
+    if (name == "srt") return OutputMode::SRT;
     throw std::invalid_argument("unsupported output mode: " + name);
 }
 
@@ -394,6 +466,8 @@ std::unique_ptr<IStreamer> CreateStreamer(StreamerConfig config)
             return std::make_unique<FileStreamer>(std::move(config));
         case OutputMode::RTP_UDP:
             return std::make_unique<RtpUdpStreamer>(std::move(config));
+        case OutputMode::SRT:
+            return std::make_unique<SrtStreamer>(std::move(config));
     }
     throw std::invalid_argument("invalid output mode");
 }
@@ -415,6 +489,7 @@ MultiStreamOutput::MultiStreamOutput(MultiStreamOutputConfig config)
         stream.port = config_.ports[index];
         stream.payload_type = config_.payload_type;
         stream.mtu = config_.mtu;
+        stream.srt_latency_ms = config_.srt_latency_ms;
         stream.queue_depth = config_.queue_depth;
         stream.file_path = (std::filesystem::path(config_.file_directory) /
                             (std::string(names[index]) + extension)).string();

@@ -7,18 +7,18 @@ four_camera_capture:
     Right_SERIAL: DB1505182
 
   image:
-    # 100 FPS 优先：保持 4:3，将四路 BayerRG8 原始负载降至约 122.9 MB/s。
-    width: 640
-    height: 480
+    # 四路全分辨率 BayerRG8；单路原始负载约 93.3 MB/s（1440×1080×60）。
+    width: 1440
+    height: 1080
     pixel_format: BayerRG8
-    frame_rate: 100
+    frame_rate: 60
 
   capture:
-    # 当前亮度试验：关闭自动曝光，固定为完整的 10 ms 触发周期。
+    # 60 Hz 帧周期约 16.67 ms；固定曝光保留读出和触发余量。
     exposure_auto: false
     exposure_time_us: 10000
-    # 100 Hz 触发周期为 10 ms，自动曝光不得跨越下一次触发。
-    auto_exposure_upper_limit_us: 8000
+    # 启用自动曝光时，上限必须小于 16.67 ms 帧周期。
+    auto_exposure_upper_limit_us: 15000
     # 自动曝光/增益的目标灰度；相机支持范围 0-255，默认 100 在当前环境偏暗。
     auto_brightness_target: 160
     # false 时 HikCamera 会读取并设置每台相机自身的 Gain 最大值。
@@ -31,17 +31,24 @@ four_camera_capture:
   trigger:
     # 可选：FREE_RUN / SOFTWARE_TRIGGER / HARDWARE_TRIGGER
     mode: SOFTWARE_TRIGGER
-    software_frequency_hz: 100
+    software_frequency_hz: 60
     trigger_cache: true
 
   buffering:
     frames_per_camera: 4
     # GetImageBuffer 的单次等待上限；超时只计数，不终止采集线程。
     grab_timeout_ms: 100
+    # 单帧为 1,555,200 B，使用 Linux SDK 建议上限 2 MiB，避免跨传输块残帧。
+    usb_transfer_size: 2097152
+    # 四台相机共享同一控制器，每台只注册一条完整帧通道以避免后启动设备抢占。
+    usb_transfer_ways: 1
+    sdk_image_nodes: 8
+    # 实际数值范围/尺度以相机 GenICam 节点为准，MV-CB016-10UC-S 实测 140000 可维持约 60 FPS。
+    device_link_throughput_limit_bps: 140000
 
   processing:
-    # 相机和软件触发仍保持 100 FPS；这里只控制同步 FrameGroup 的下游输出节拍。
-    output_fps: 80
+    # 采集、同步组帧和下游输出均保持 60 FPS，不做抽帧。
+    output_fps: 60
 
   isp:
     enabled: true
@@ -61,23 +68,24 @@ four_camera_capture:
   encoder:
     enabled: true
     codec: h264
-    fps: 80
+    fps: 60
     bitrate_front: 20000000
     bitrate_rear: 20000000
     bitrate_left: 20000000
     bitrate_right: 20000000
-    gop: 40
+    gop: 30
     low_latency: true
     active_cameras: 4
     queue_depth: 2
 
   output:
-    mode: null
+    mode: srt
     file_directory: ./encoded
     queue_depth: 2
 
   network:
-    server_ip: "127.0.0.1"
+    server_ip: "192.168.3.93"
+    srt_latency_ms: 500
     payload_type: 96
     mtu: 1400
     metadata_enabled: true

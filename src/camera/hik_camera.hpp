@@ -16,17 +16,21 @@ enum class TriggerMode {
 struct HikCameraParameters {
     std::uint32_t width = 1440;
     std::uint32_t height = 1080;
-    float frame_rate = 100.0F;
+    float frame_rate = 60.0F;
     MvGvspPixelType pixel_format = PixelType_Gvsp_BayerRG8;
     bool exposure_auto = true;
     float exposure_time_us = 10000.0F;
-    float auto_exposure_upper_limit_us = 8000.0F;
+    float auto_exposure_upper_limit_us = 15000.0F;
     std::uint32_t auto_brightness_target = 160;
     bool gain_auto = true;
     float white_balance_red = 1.8F;
     float white_balance_blue = 1.6F;
     bool trigger_cache = true;
     TriggerMode trigger_mode = TriggerMode::SOFTWARE_TRIGGER;
+    std::uint32_t usb_transfer_size = 2U * 1024U * 1024U;
+    std::uint32_t usb_transfer_ways = 4;
+    std::uint32_t sdk_image_nodes = 8;
+    std::uint32_t device_link_throughput_limit_bps = 0;
 };
 
 struct HikDeviceInfo {
